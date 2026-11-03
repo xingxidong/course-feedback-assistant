@@ -4,5 +4,6 @@
 __pycache__/
 *.pyc
 logs/*.log
+data/bin/
 .env
 .DS_Store

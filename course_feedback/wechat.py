@@ -5,6 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from . import wechat_gui
+
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "wechat-cli.mjs"
 
@@ -29,10 +31,16 @@ def status() -> dict:
     return run("status", timeout=10)
 
 def prepare(chat: str, text: str) -> dict:
-    return run("prepare", chat, text, timeout=30)
+    result = run("prepare", chat, text, timeout=30)
+    if not result.get("ok"):
+        return wechat_gui.prepare(chat, text)
+    return result
 
 def send(chat: str, text: str) -> dict:
-    return run("send", chat, text, timeout=35)
+    result = run("send", chat, text, timeout=35)
+    if not result.get("ok"):
+        return wechat_gui.send(chat, text)
+    return result
 
 def read(chat: str) -> dict:
     return run("read", chat, timeout=25)

@@ -73,6 +73,11 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 db.set_student_active(int(m.group(1)), bool(body.get("active")))
                 return self._json({"ok": True})
+            m = re.fullmatch(r"/api/students/(\d+)/delete", path)
+            if m:
+                try: db.archive_student(int(m.group(1)))
+                except Exception as e: raise ApiError(400, str(e))
+                return self._json({"ok": True})
             if path == "/api/generate":
                 label = str(body.get("label", "")).strip()
                 intro = str(body.get("course_intro", "")).strip()

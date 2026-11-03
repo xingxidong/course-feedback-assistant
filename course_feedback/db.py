@@ -102,6 +102,14 @@ def set_student_active(student_id: int, active: bool) -> None:
     with connect() as con:
         con.execute("UPDATE students SET active=?, updated_at=? WHERE id=?", (1 if active else 0, now(), student_id))
 
+def archive_student(student_id: int) -> None:
+    """Hide a student while preserving historical drafts and send logs."""
+    with connect() as con:
+        found = con.execute("SELECT id FROM students WHERE id=?", (student_id,)).fetchone()
+        if not found:
+            raise ValueError("学生不存在")
+        con.execute("UPDATE students SET active=0, updated_at=? WHERE id=?", (now(), student_id))
+
 def save_week(label: str, course_intro: str, topics: list[str]) -> int:
     label, course_intro = label.strip(), course_intro.strip()
     topics = [str(x).strip() for x in topics if str(x).strip()]
@@ -140,7 +148,7 @@ def log_action(draft_id: int, action: str, result: dict) -> None:
                     (draft_id, action, json.dumps(result, ensure_ascii=False), now()))
 
 def list_students() -> list[dict]:
-    return rows("SELECT * FROM students ORDER BY active DESC, grade, id")
+    return rows("SELECT * FROM students WHERE active=1 ORDER BY grade, id")
 
 def list_drafts() -> list[dict]:
     return rows("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json

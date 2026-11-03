@@ -155,6 +155,7 @@ def list_drafts() -> list[dict]:
     return rows("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json
       FROM drafts d JOIN students s ON s.id=d.student_id JOIN weeks w ON w.id=d.week_id
       WHERE d.week_id=(SELECT week_id FROM drafts ORDER BY updated_at DESC,id DESC LIMIT 1)
+        AND d.status!='sent'
       ORDER BY d.id""")
 
 def get_draft(draft_id: int) -> dict | None:

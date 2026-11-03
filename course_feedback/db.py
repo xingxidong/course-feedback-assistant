@@ -151,9 +151,11 @@ def list_students() -> list[dict]:
     return rows("SELECT * FROM students WHERE active=1 ORDER BY grade, id")
 
 def list_drafts() -> list[dict]:
+    """Return only the most recently generated batch; older weeks remain in history."""
     return rows("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json
       FROM drafts d JOIN students s ON s.id=d.student_id JOIN weeks w ON w.id=d.week_id
-      ORDER BY d.id DESC""")
+      WHERE d.week_id=(SELECT week_id FROM drafts ORDER BY updated_at DESC,id DESC LIMIT 1)
+      ORDER BY d.id""")
 
 def get_draft(draft_id: int) -> dict | None:
     return one("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json

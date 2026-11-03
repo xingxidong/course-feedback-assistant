@@ -12,7 +12,7 @@ SYSTEM_PROMPT = """你是一名严谨、真诚的高中物理教师。请根据�
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-def _topic_sentence(index: int, topic: str) -> str:
+def _topic_sentence(index: int, topic: str, action: str = "学习") -> str:
     t = topic.strip().rstrip("。；;")
     maps = [
         ("动态平衡", "理解物体在缓慢变化过程中始终满足平衡条件的特点，掌握力的大小和方向变化的判断方法"),
@@ -35,7 +35,7 @@ def _topic_sentence(index: int, topic: str) -> str:
         ("电流", "理解电流的形成条件、电流强度及其微观意义，巩固相关表达式的运用"),
     ]
     detail = next((v for k, v in maps if k in t), f"梳理{t}的基本概念、核心规律和典型题型，进一步规范分析与计算过程")
-    return f"{index}.复习（学习）{t}，{detail}。"
+    return f"{index}.{action}{t}，{detail}。"
 
 def _performance(notes: str, name: str) -> str:
     n = re.sub(r"\s+", "", notes)
@@ -73,8 +73,10 @@ def _performance(notes: str, name: str) -> str:
     return first + middle + end
 
 def deterministic_generate(name: str, course_intro: str, topics: list[str], notes: str) -> str:
-    topic_text = "".join(_topic_sentence(i, t) for i, t in enumerate(topics, 1))
-    return f"课程内容：{course_intro.strip()}。{topic_text}\n\n课堂表现：{_performance(notes, name)}"
+    action = "预习" if "预习" in course_intro and "复习" not in course_intro else "复习" if "复习" in course_intro else "学习"
+    topic_text = "".join(_topic_sentence(i, t, action) for i, t in enumerate(topics, 1))
+    intro = course_intro.strip().rstrip("。")
+    return f"课程内容：{intro}。{topic_text}\n\n课堂表现：{_performance(notes, name)}"
 
 def _llm_generate(name: str, course_intro: str, topics: list[str], notes: str) -> str | None:
     base = os.getenv("COURSE_FEEDBACK_API_BASE", "").rstrip("/")

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -81,54 +82,73 @@ def deterministic_generate(name: str, course_intro: str, topics: list[str], note
     intro = course_intro.strip().rstrip("。")
     return f"课程内容：{intro}。{topic_text}\n\n课堂表现：{_performance(notes, name)}"
 
-def _model_config() -> dict | None:
+def _keychain_secret(service: str, account: str) -> str:
+    try:
+        result = subprocess.run(["/usr/bin/security", "find-generic-password", "-w", "-s", service, "-a", account],
+                                capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def _model_configs() -> list[dict]:
     if os.getenv("COURSE_FEEDBACK_DISABLE_LLM") == "1":
-        return None
+        return []
+    configs: list[dict] = []
     env_base = os.getenv("COURSE_FEEDBACK_API_BASE", "").rstrip("/")
     env_key = os.getenv("COURSE_FEEDBACK_API_KEY", "")
     env_model = os.getenv("COURSE_FEEDBACK_MODEL", "")
     if env_base and env_key and env_model:
-        return {"base": env_base, "key": env_key, "model": env_model, "provider": "environment"}
-    try:
-        config = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
-        model_spec = config.get("model", {})
-        provider_name = model_spec.get("provider", "")
-        model = model_spec.get("default", "")
-        providers = config.get("providers", {})
-        if provider_name == "openai":
-            provider = providers.get("openai", {})
-        elif provider_name.startswith("openai_compatible:"):
-            wanted = provider_name.split(":", 1)[1]
-            provider = next((p for p in providers.get("openai_compatible", []) if p.get("name") == wanted), {})
-        else:
-            provider = {}
-        base, key = str(provider.get("base_url", "")).rstrip("/"), provider.get("api_key", "")
-        if base and key and model:
-            return {"base": base, "key": key, "model": model, "provider": provider_name}
-    except Exception:
-        pass
-    return None
+        configs.append({"base": env_base, "key": env_key, "model": env_model, "provider": "environment"})
+    else:
+        try:
+            hermes = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+            model_spec = hermes.get("model", {})
+            provider_name = model_spec.get("provider", "")
+            model = model_spec.get("default", "")
+            providers = hermes.get("providers", {})
+            if provider_name == "openai":
+                provider = providers.get("openai", {})
+            elif provider_name.startswith("openai_compatible:"):
+                wanted = provider_name.split(":", 1)[1]
+                provider = next((p for p in providers.get("openai_compatible", []) if p.get("name") == wanted), {})
+            else:
+                provider = {}
+            base, key = str(provider.get("base_url", "")).rstrip("/"), provider.get("api_key", "")
+            if base and key and model:
+                configs.append({"base": base, "key": key, "model": model, "provider": provider_name})
+        except Exception:
+            pass
+    deepseek_key = _keychain_secret("课评助手.DeepSeek", "deepseek-api")
+    if deepseek_key and not any(c["provider"] == "deepseek-backup" or "deepseek" in c["base"] for c in configs):
+        configs.append({"base": "https://api.deepseek.com/v1", "key": deepseek_key,
+                        "model": "deepseek-chat", "provider": "deepseek-backup"})
+    return configs
 
 def model_info() -> dict:
-    config = _model_config()
-    return {"enabled": bool(config), "model": config["model"] if config else "本地规则引擎",
-            "provider": config["provider"] if config else "local"}
+    configs = _model_configs()
+    if not configs:
+        return {"enabled": False, "model": "本地规则引擎", "provider": "local", "fallback": ""}
+    return {"enabled": True, "model": configs[0]["model"], "provider": configs[0]["provider"],
+            "fallback": configs[1]["model"] if len(configs) > 1 else "本地规则引擎"}
 
 def _llm_generate(name: str, course_intro: str, topics: list[str], notes: str) -> str | None:
-    config = _model_config()
-    if not config: return None
-    payload = {"model": config["model"], "messages": [
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"学生：{name}\n课程概述：{course_intro}\n知识点：{json.dumps(topics, ensure_ascii=False)}\n课堂观察：{notes}"},
-    ]}
-    req = Request(config["base"] + "/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": "Bearer " + config["key"], "Content-Type": "application/json"})
-    try:
-        with urlopen(req, timeout=90) as response:
-            result = json.loads(response.read())
-        text = result["choices"][0]["message"]["content"].strip()
-        return text if "课程内容" in text and "课堂表现" in text else None
-    except Exception:
-        return None
+    ]
+    for config in _model_configs():
+        payload = {"model": config["model"], "messages": messages}
+        req = Request(config["base"] + "/chat/completions", data=json.dumps(payload).encode(),
+                      headers={"Authorization": "Bearer " + config["key"], "Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=90) as response:
+                result = json.loads(response.read())
+            text = result["choices"][0]["message"]["content"].strip()
+            if "课程内容" in text and "课堂表现" in text:
+                return text
+        except Exception:
+            continue
+    return None
 
 def generate(name: str, course_intro: str, topics: list[str], notes: str) -> str:
     return _llm_generate(name, course_intro, topics, notes) or deterministic_generate(name, course_intro, topics, notes)

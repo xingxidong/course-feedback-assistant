@@ -31,16 +31,12 @@ def status() -> dict:
     return run("status", timeout=10)
 
 def prepare(chat: str, text: str) -> dict:
-    result = run("prepare", chat, text, timeout=30)
-    if not result.get("ok"):
-        return wechat_gui.prepare(chat, text)
-    return result
+    # This WeChat build hides its Accessibility tree; use the exact-title OCR path only.
+    return wechat_gui.prepare(chat, text)
 
 def send(chat: str, text: str) -> dict:
-    result = run("send", chat, text, timeout=35)
-    if not result.get("ok"):
-        return wechat_gui.send(chat, text)
-    return result
+    # Never cascade from an ambiguous native failure into a second send attempt.
+    return wechat_gui.send(chat, text)
 
 def read(chat: str) -> dict:
     return run("read", chat, timeout=25)

@@ -47,7 +47,12 @@ CREATE TABLE IF NOT EXISTS send_logs (
   draft_id INTEGER NOT NULL REFERENCES drafts(id),
   action TEXT NOT NULL,
   result_json TEXT NOT NULL,
+  chat_title TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 """
 
@@ -69,6 +74,9 @@ def connect():
 def init_db() -> None:
     with connect() as con:
         con.executescript(SCHEMA)
+        log_columns = {row[1] for row in con.execute("PRAGMA table_info(send_logs)")}
+        if "chat_title" not in log_columns:
+            con.execute("ALTER TABLE send_logs ADD COLUMN chat_title TEXT NOT NULL DEFAULT ''")
 
 def rows(sql: str, params=()) -> list[dict]:
     with connect() as con:
@@ -81,9 +89,9 @@ def one(sql: str, params=()) -> dict | None:
 
 def upsert_student(data: dict) -> dict:
     name = str(data.get("name", "")).strip()
-    chat = str(data.get("chat_title", "")).strip()
-    if not name or not chat:
-        raise ValueError("学生姓名和微信群名不能为空")
+    if not name:
+        raise ValueError("学生姓名不能为空")
+    chat = str(data.get("chat_title", "")).strip() or f"待填写：{name}"
     grade = str(data.get("grade", "")).strip()
     notes = str(data.get("default_notes", "")).strip()
     ts = now()
@@ -93,8 +101,13 @@ def upsert_student(data: dict) -> dict:
             con.execute("UPDATE students SET name=?, grade=?, chat_title=?, default_notes=?, updated_at=? WHERE id=?",
                         (name, grade, chat, notes, ts, int(sid)))
         else:
-            con.execute("INSERT INTO students(name,grade,chat_title,default_notes,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                        (name, grade, chat, notes, ts, ts))
+            existing = con.execute("SELECT id FROM students WHERE name=?", (name,)).fetchone()
+            if existing:
+                con.execute("UPDATE students SET grade=?,chat_title=?,default_notes=?,active=1,updated_at=? WHERE id=?",
+                            (grade, chat, notes, ts, int(existing[0])))
+            else:
+                con.execute("INSERT INTO students(name,grade,chat_title,default_notes,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                            (name, grade, chat, notes, ts, ts))
         r = con.execute("SELECT * FROM students WHERE name=?", (name,)).fetchone()
         return dict(r)
 
@@ -129,12 +142,63 @@ def save_draft(week_id: int, student_id: int, notes: str, content: str, content_
                     (week_id, student_id, notes, content, content_hash, now()))
         return int(con.execute("SELECT id FROM drafts WHERE week_id=? AND student_id=?", (week_id, student_id)).fetchone()[0])
 
+def save_batch(label: str, course_intro: str, topics: list[str], generated: list[dict]) -> list[int]:
+    """Atomically replace one generation batch and make it the explicit current batch."""
+    label, course_intro = label.strip(), course_intro.strip()
+    topics = [str(x).strip() for x in topics if str(x).strip()]
+    if not label or not course_intro or not topics:
+        raise ValueError("周次、课程概述和知识点不能为空")
+    if not generated:
+        raise ValueError("没有可保存的学生反馈")
+    ts = now()
+    selected_ids = [int(item["student_id"]) for item in generated]
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""INSERT INTO weeks(label,course_intro,topics_json,created_at) VALUES(?,?,?,?)
+          ON CONFLICT(label) DO UPDATE SET course_intro=excluded.course_intro,topics_json=excluded.topics_json""",
+                    (label, course_intro, json.dumps(topics, ensure_ascii=False), ts))
+        week_id = int(con.execute("SELECT id FROM weeks WHERE label=?", (label,)).fetchone()[0])
+        placeholders = ",".join("?" for _ in selected_ids)
+        con.execute(f"UPDATE drafts SET status='archived',error='',updated_at=? WHERE week_id=? AND student_id NOT IN ({placeholders}) AND status!='sent'",
+                    (ts, week_id, *selected_ids))
+        draft_ids = []
+        for item in generated:
+            protected = con.execute("SELECT status FROM drafts WHERE week_id=? AND student_id=?", (week_id, int(item["student_id"]))).fetchone()
+            if protected and protected[0] in {"sent", "sending", "uncertain"}:
+                raise ValueError("所选学生在该周次的反馈已发送、正在发送或结果待确认，不能重新生成")
+            con.execute("""INSERT INTO drafts(week_id,student_id,notes,content,content_hash,status,error,updated_at,sent_at)
+              VALUES(?,?,?,?,?,'draft','',?,NULL)
+              ON CONFLICT(week_id,student_id) DO UPDATE SET notes=excluded.notes,content=excluded.content,
+              content_hash=excluded.content_hash,status='draft',error='',updated_at=excluded.updated_at,sent_at=NULL
+              WHERE drafts.status NOT IN ('sent','sending','uncertain')""",
+                        (week_id, int(item["student_id"]), item["notes"], item["content"], item["content_hash"], ts))
+            draft_ids.append(int(con.execute("SELECT id FROM drafts WHERE week_id=? AND student_id=?", (week_id, int(item["student_id"]))).fetchone()[0]))
+        con.execute("INSERT INTO app_state(key,value) VALUES('current_week_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(week_id),))
+        return draft_ids
+
+def is_chat_configured(chat_title: str) -> bool:
+    value = str(chat_title or "").strip()
+    return bool(value) and not value.startswith("待填写") and value not in {"未填写", "待定", "暂无"}
+
 def update_draft(draft_id: int, content: str, content_hash: str) -> None:
     if not content.strip():
         raise ValueError("反馈正文不能为空")
     with connect() as con:
-        con.execute("UPDATE drafts SET content=?,content_hash=?,status='draft',error='',updated_at=?,sent_at=NULL WHERE id=?",
+        row = con.execute("SELECT status FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row:
+            raise ValueError("草稿不存在")
+        if row[0] in {"sent", "sending", "uncertain"}:
+            raise ValueError("该反馈已发送、正在发送或发送结果待确认，不能再修改")
+        con.execute("UPDATE drafts SET content=?,content_hash=?,status='draft',error='',updated_at=? WHERE id=?",
                     (content.strip(), content_hash, now(), draft_id))
+
+def claim_send(draft_id: int) -> bool:
+    """Atomically reserve one draft for sending; concurrent/repeated sends fail closed."""
+    with connect() as con:
+        cur = con.execute("""UPDATE drafts SET status='sending',error='',updated_at=?
+          WHERE id=? AND status NOT IN ('sent','sending','uncertain','archived')
+          AND student_id IN (SELECT id FROM students WHERE active=1)""", (now(), draft_id))
+        return cur.rowcount == 1
 
 def mark_draft(draft_id: int, status: str, error: str = "") -> None:
     sent_at = now() if status == "sent" else None
@@ -144,24 +208,28 @@ def mark_draft(draft_id: int, status: str, error: str = "") -> None:
 
 def log_action(draft_id: int, action: str, result: dict) -> None:
     with connect() as con:
-        con.execute("INSERT INTO send_logs(draft_id,action,result_json,created_at) VALUES(?,?,?,?)",
-                    (draft_id, action, json.dumps(result, ensure_ascii=False), now()))
+        chat = con.execute("""SELECT s.chat_title FROM drafts d JOIN students s ON s.id=d.student_id WHERE d.id=?""", (draft_id,)).fetchone()
+        con.execute("INSERT INTO send_logs(draft_id,action,result_json,chat_title,created_at) VALUES(?,?,?,?,?)",
+                    (draft_id, action, json.dumps(result, ensure_ascii=False), chat[0] if chat else "", now()))
 
 def list_students() -> list[dict]:
-    return rows("SELECT * FROM students WHERE active=1 ORDER BY grade, id")
+    return rows("""SELECT * FROM students WHERE active=1
+      ORDER BY CASE grade WHEN '高一' THEN 1 WHEN '高二' THEN 2 WHEN '高三' THEN 3 ELSE 9 END, id""")
 
 def list_drafts() -> list[dict]:
     """Return only the most recently generated batch; older weeks remain in history."""
     return rows("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json
       FROM drafts d JOIN students s ON s.id=d.student_id JOIN weeks w ON w.id=d.week_id
-      WHERE d.week_id=(SELECT week_id FROM drafts ORDER BY updated_at DESC,id DESC LIMIT 1)
-        AND s.active=1 AND d.status!='sent'
+      WHERE d.week_id=CAST((SELECT value FROM app_state WHERE key='current_week_id') AS INTEGER)
+        AND s.active=1 AND d.status NOT IN ('sent','archived')
       ORDER BY d.id""")
 
 def get_draft(draft_id: int) -> dict | None:
-    return one("""SELECT d.*,s.name,s.grade,s.chat_title,w.label,w.course_intro,w.topics_json
+    return one("""SELECT d.*,s.name,s.grade,s.chat_title,s.active,w.label,w.course_intro,w.topics_json
       FROM drafts d JOIN students s ON s.id=d.student_id JOIN weeks w ON w.id=d.week_id WHERE d.id=?""", (draft_id,))
 
 def recent_logs(limit: int = 50) -> list[dict]:
-    return rows("""SELECT l.*,s.name,s.chat_title FROM send_logs l JOIN drafts d ON d.id=l.draft_id
+    return rows("""SELECT l.id,l.draft_id,l.action,l.result_json,l.created_at,s.name,
+      COALESCE(NULLIF(l.chat_title,''),s.chat_title) AS chat_title
+      FROM send_logs l JOIN drafts d ON d.id=l.draft_id
       JOIN students s ON s.id=d.student_id ORDER BY l.id DESC LIMIT ?""", (limit,))

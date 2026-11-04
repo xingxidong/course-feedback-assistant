@@ -86,20 +86,28 @@ def _ocr_region(x: int, y: int, w: int, h: int, name: str) -> list[str]:
 def _open_verified_chat(chat: str) -> dict:
     _ensure_window(); _build_helpers()
     _clipboard_set(chat)
-    _osascript(SEARCH_MENU_SCRIPT)
+    if _osascript(SEARCH_MENU_SCRIPT) != "clicked":
+        raise RuntimeError("未能打开微信本地搜索，已停止")
     time.sleep(0.25)
     _keys(['keystroke "a" using command down', 'keystroke "v" using command down'])
     time.sleep(0.8)
-    # Return opens WeChat's first local exact match; title OCR below is authoritative.
+    x, y, w, h = _window_bounds()
+    wanted = _normalize_title(chat)
+    search_lines = _ocr_region(x, y, max(220, int(w * 0.22)), min(360, int(h * 0.45)), "search")
+    exact_result = any(_normalize_title(line) == wanted for line in search_lines)
+    local_group_section = any("群聊" in line for line in search_lines)
+    if not (exact_result and local_group_section):
+        # If focus was wrong, remove only the text just pasted; never press Return.
+        _keys(['keystroke "a" using command down', 'key code 51'])
+        raise RuntimeError(f"未在微信本地群聊结果中找到“{chat}”，已停止")
+    # Only after an exact local result is visible may Return open it.
     _keys(['key code 36'])
     time.sleep(0.9)
-    x, y, w, h = _window_bounds()
     # Main chat header lies between the left conversation list and any optional right-side panel.
     header_lines = _ocr_region(x + int(w * 0.15), y, int(w * 0.48), min(110, h), "header")
-    wanted = _normalize_title(chat)
-    matched = any(wanted == _normalize_title(line) or wanted in _normalize_title(line) for line in header_lines)
+    matched = any(_normalize_title(line) == wanted for line in header_lines)
     if not matched:
-        raise RuntimeError(f"未能核验微信会话“{chat}”，已停止写入")
+        raise RuntimeError(f"未能精确核验微信会话“{chat}”，已停止写入")
     return {"chat": chat, "header": header_lines, "bounds": [x, y, w, h]}
 
 def _focus_input(bounds: list[int]) -> None:
@@ -124,6 +132,31 @@ def _write_and_verify(text: str, bounds: list[int]) -> None:
         # Never send when the exact draft cannot be read back.
         _keys(['key code 51'])
         raise RuntimeError("微信输入框内容校验失败，已停止发送")
+    # Collapse the Select-All range so the user can edit normally and Return cannot replace it.
+    _keys(['key code 124'])
+
+def _input_value(bounds: list[int]) -> str:
+    _focus_input(bounds)
+    marker = "__EMPTY__" + uuid.uuid4().hex
+    _clipboard_set(marker)
+    _keys(['keystroke "a" using command down', 'keystroke "c" using command down'])
+    time.sleep(0.15)
+    copied = _clipboard_get()
+    _keys(['key code 124'])
+    return "" if copied == marker else copied
+
+def _normalize_message(value: str) -> str:
+    return re.sub(r"[^\w\u3400-\u9fff]", "", value).lower()
+
+def _verify_posted(text: str, bounds: list[int]) -> bool:
+    x, y, w, h = bounds
+    lines = _ocr_region(x + int(w * 0.15), y + 80, int(w * 0.48), max(220, int(h * 0.72)), "delivery")
+    seen = _normalize_message("".join(lines))
+    wanted = _normalize_message(text)
+    if len(wanted) < 8:
+        return wanted in seen
+    # The tail of the newest long bubble remains visible at the bottom of the chat.
+    return wanted[-10:] in seen or wanted[-16:-6] in seen
 
 def prepare(chat: str, text: str) -> dict:
     try:
@@ -134,11 +167,29 @@ def prepare(chat: str, text: str) -> dict:
         return {"ok": False, "error": "WECHAT_GUI_FALLBACK_FAILED", "detail": str(e)}
 
 def send(chat: str, text: str) -> dict:
+    send_triggered = False
     try:
         selected = _open_verified_chat(chat)
-        _write_and_verify(text, selected["bounds"])
-        _keys(['key code 36'])
-        time.sleep(0.6)
-        return {"ok": True, "chat": chat, "inputCleared": True, "deliveryAttempted": True, "fallback": "gui-ocr"}
+        bounds = selected["bounds"]
+        _write_and_verify(text, bounds)
+        shortcuts = [(['key code 36'], "Return"),
+                     (['key code 36 using command down'], "Command+Return"),
+                     (['key code 36 using control down'], "Control+Return")]
+        for keys, name in shortcuts:
+            send_triggered = True
+            _keys(keys)
+            time.sleep(0.5)
+            if not _input_value(bounds).strip():
+                time.sleep(0.8)
+                if _verify_posted(text, bounds):
+                    return {"ok": True, "chat": chat, "inputCleared": True,
+                            "deliveryConfirmed": True, "shortcut": name, "fallback": "gui-ocr"}
+                return {"ok": False, "error": "WECHAT_DELIVERY_UNCERTAIN", "uncertain": True,
+                        "detail": "输入框已清空，但未能在聊天区核验到刚发送的正文。请先人工检查微信，切勿直接重发。"}
+        return {"ok": False, "error": "WECHAT_DELIVERY_UNCERTAIN", "uncertain": True,
+                "detail": "已经触发发送快捷键，但无法确认发送结果。请先人工检查微信，切勿直接重发。"}
     except Exception as e:
+        if send_triggered:
+            return {"ok": False, "error": "WECHAT_DELIVERY_UNCERTAIN", "uncertain": True,
+                    "detail": f"已经触发发送动作，但后续核验异常：{e}。请先人工检查微信，切勿直接重发。"}
         return {"ok": False, "error": "WECHAT_GUI_FALLBACK_FAILED", "detail": str(e)}

@@ -5,7 +5,10 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 from urllib.request import Request, urlopen
+
+import yaml
 
 SYSTEM_PROMPT = """你是一名严谨、真诚的高中物理教师。请根据课程知识点和学生表现，写一份发给家长的课程反馈。固定分为“课程内容”和“课堂表现”两段。表达客观、委婉、具体；不比较学生，不使用“笨、差、没救”等词；既指出问题，也给出可执行建议。课程内容逐项编号，保留物理术语。只输出正文。"""
 
@@ -78,16 +81,47 @@ def deterministic_generate(name: str, course_intro: str, topics: list[str], note
     intro = course_intro.strip().rstrip("。")
     return f"课程内容：{intro}。{topic_text}\n\n课堂表现：{_performance(notes, name)}"
 
+def _model_config() -> dict | None:
+    if os.getenv("COURSE_FEEDBACK_DISABLE_LLM") == "1":
+        return None
+    env_base = os.getenv("COURSE_FEEDBACK_API_BASE", "").rstrip("/")
+    env_key = os.getenv("COURSE_FEEDBACK_API_KEY", "")
+    env_model = os.getenv("COURSE_FEEDBACK_MODEL", "")
+    if env_base and env_key and env_model:
+        return {"base": env_base, "key": env_key, "model": env_model, "provider": "environment"}
+    try:
+        config = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+        model_spec = config.get("model", {})
+        provider_name = model_spec.get("provider", "")
+        model = model_spec.get("default", "")
+        providers = config.get("providers", {})
+        if provider_name == "openai":
+            provider = providers.get("openai", {})
+        elif provider_name.startswith("openai_compatible:"):
+            wanted = provider_name.split(":", 1)[1]
+            provider = next((p for p in providers.get("openai_compatible", []) if p.get("name") == wanted), {})
+        else:
+            provider = {}
+        base, key = str(provider.get("base_url", "")).rstrip("/"), provider.get("api_key", "")
+        if base and key and model:
+            return {"base": base, "key": key, "model": model, "provider": provider_name}
+    except Exception:
+        pass
+    return None
+
+def model_info() -> dict:
+    config = _model_config()
+    return {"enabled": bool(config), "model": config["model"] if config else "本地规则引擎",
+            "provider": config["provider"] if config else "local"}
+
 def _llm_generate(name: str, course_intro: str, topics: list[str], notes: str) -> str | None:
-    base = os.getenv("COURSE_FEEDBACK_API_BASE", "").rstrip("/")
-    key = os.getenv("COURSE_FEEDBACK_API_KEY", "")
-    model = os.getenv("COURSE_FEEDBACK_MODEL", "")
-    if not (base and key and model): return None
-    payload = {"model": model, "temperature": 0.45, "messages": [
+    config = _model_config()
+    if not config: return None
+    payload = {"model": config["model"], "messages": [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"学生：{name}\n课程概述：{course_intro}\n知识点：{json.dumps(topics, ensure_ascii=False)}\n课堂观察：{notes}"},
     ]}
-    req = Request(base + "/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    req = Request(config["base"] + "/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": "Bearer " + config["key"], "Content-Type": "application/json"})
     try:
         with urlopen(req, timeout=90) as response:
             result = json.loads(response.read())

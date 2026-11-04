@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -57,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
                 if STATIC.resolve() not in target.parents: raise ApiError(403, "禁止访问")
                 return self._file(target)
             if path == "/api/state":
-                return self._json({"ok": True, "students": db.list_students(), "drafts": db.list_drafts(), "logs": db.recent_logs(), "wechat": wechat.status()})
+                return self._json({"ok": True, "students": db.list_students(), "drafts": db.list_drafts(), "logs": db.recent_logs(), "wechat": wechat.status(), "model": generator.model_info()})
             raise ApiError(404, "接口不存在")
         except ApiError as e: self._json({"ok": False, "error": e.message}, e.status)
         except Exception as e: self._json({"ok": False, "error": str(e)}, 500)
@@ -83,17 +82,19 @@ class Handler(BaseHTTPRequestHandler):
                 intro = str(body.get("course_intro", "")).strip()
                 topics = body.get("topics", [])
                 if isinstance(topics, str): topics = [x.strip() for x in topics.splitlines() if x.strip()]
-                try: week_id = db.save_week(label, intro, topics)
-                except Exception as e: raise ApiError(400, str(e))
                 selected = {int(x) for x in body.get("student_ids", [])}
+                if not selected: raise ApiError(400, "没有选中学生")
                 notes_by_id = {int(k): str(v) for k, v in body.get("student_notes", {}).items()}
-                students = [s for s in db.list_students() if s["active"] and (not selected or s["id"] in selected)]
-                if not students: raise ApiError(400, "没有选中学生")
-                ids = []
+                students = [s for s in db.list_students() if s["id"] in selected]
+                if not students: raise ApiError(400, "选中的学生不存在或已删除")
+                generated = []
                 for s in students:
                     notes = notes_by_id.get(s["id"], "").strip() or s["default_notes"]
                     content = generator.generate(s["name"], intro, topics, notes)
-                    ids.append(db.save_draft(week_id, s["id"], notes, content, generator.content_hash(content)))
+                    generated.append({"student_id": s["id"], "notes": notes, "content": content,
+                                      "content_hash": generator.content_hash(content)})
+                try: ids = db.save_batch(label, intro, topics, generated)
+                except Exception as e: raise ApiError(400, str(e))
                 return self._json({"ok": True, "draft_ids": ids, "count": len(ids)})
             m = re.fullmatch(r"/api/drafts/(\d+)", path)
             if m:
@@ -106,29 +107,20 @@ class Handler(BaseHTTPRequestHandler):
                 draft_id, action = int(m.group(1)), m.group(2)
                 draft = db.get_draft(draft_id)
                 if not draft: raise ApiError(404, "草稿不存在")
-                if action == "send" and body.get("confirmation") != "确认发送": raise ApiError(400, "缺少发送确认")
-                if action == "send" and draft["status"] == "sent" and not body.get("force"): raise ApiError(409, "该反馈已经发送；如需重发必须明确选择强制重发")
-                result = wechat.prepare(draft["chat_title"], draft["content"]) if action == "prepare" else wechat.send(draft["chat_title"], draft["content"])
-                db.log_action(draft_id, action, result)
-                db.mark_draft(draft_id, "prepared" if action == "prepare" and result.get("ok") else "sent" if action == "send" and result.get("ok") else "error", "" if result.get("ok") else result.get("detail") or result.get("error", "失败"))
-                return self._json(result, 200 if result.get("ok") else 502)
-            if path == "/api/send-batch":
-                if body.get("confirmation") != "确认发送": raise ApiError(400, "必须输入“确认发送”")
-                ids = [int(x) for x in body.get("draft_ids", [])]
-                if not ids: raise ApiError(400, "没有选中草稿")
-                results = []
-                for draft_id in ids:
-                    draft = db.get_draft(draft_id)
-                    if not draft:
-                        results.append({"id": draft_id, "ok": False, "error": "草稿不存在"}); continue
-                    if draft["status"] == "sent":
-                        results.append({"id": draft_id, "name": draft["name"], "ok": False, "error": "已发送，已跳过"}); continue
+                if not draft["active"]: raise ApiError(400, "该学生已删除，不能发送")
+                if not db.is_chat_configured(draft["chat_title"]):
+                    raise ApiError(400, f"请先为{draft['name']}填写准确的微信会话名称")
+                if action == "send":
+                    if body.get("confirmation") != "确认发送": raise ApiError(400, "缺少发送确认")
+                    if not db.claim_send(draft_id): raise ApiError(409, "该反馈已发送、正在发送或已归档")
                     result = wechat.send(draft["chat_title"], draft["content"])
-                    db.log_action(draft_id, "send", result)
-                    db.mark_draft(draft_id, "sent" if result.get("ok") else "error", "" if result.get("ok") else result.get("detail") or result.get("error", "失败"))
-                    results.append({"id": draft_id, "name": draft["name"], **result})
-                    time.sleep(2)
-                return self._json({"ok": all(x.get("ok") for x in results), "results": results})
+                    final_status = "sent" if result.get("ok") else "uncertain" if result.get("uncertain") else "error"
+                else:
+                    result = wechat.prepare(draft["chat_title"], draft["content"])
+                    final_status = "prepared" if result.get("ok") else "error"
+                db.log_action(draft_id, action, result)
+                db.mark_draft(draft_id, final_status, "" if result.get("ok") else result.get("detail") or result.get("error", "失败"))
+                return self._json(result, 200 if result.get("ok") else 502)
             raise ApiError(404, "接口不存在")
         except ApiError as e: self._json({"ok": False, "error": e.message}, e.status)
         except Exception as e: self._json({"ok": False, "error": str(e)}, 500)

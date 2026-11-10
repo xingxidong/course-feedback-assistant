@@ -60,20 +60,108 @@ def _keys(lines: list[str]) -> None:
     body = "\n".join(lines)
     _osascript(f'tell application "System Events"\n{body}\nend tell')
 
+_WINLIST_SRC = r'''
+import Cocoa
+let opts = CGWindowListOption(arrayLiteral: .excludeDesktopElements)
+let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as! [[String: Any]]
+for w in list {
+    let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
+    guard owner == "WeChat" || owner == "微信" else { continue }
+    let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+    let x = b["X"] as? Double ?? -1, y = b["Y"] as? Double ?? -1
+    let ww = b["Width"] as? Double ?? -1, hh = b["Height"] as? Double ?? -1
+    let layer = w[kCGWindowLayer as String] as? Int ?? -1
+    let onscreen = w[kCGWindowIsOnscreen as String] as? Bool ?? false
+    let alpha = w[kCGWindowAlpha as String] as? Double ?? -1
+    if ww >= 400 && hh >= 300 && layer == 0 && onscreen && alpha > 0.05 {
+        print(String(format: "%d %d %d %d", Int(x), Int(y), Int(ww), Int(hh)))
+    }
+}
+'''
+
+def _build_winlist() -> None:
+    BIN.mkdir(parents=True, exist_ok=True)
+    source = ROOT / "scripts" / "wechat-winlist.swift"
+    target = BIN / "wechat-winlist"
+    if target.exists() and source.exists() and target.stat().st_mtime >= source.stat().st_mtime:
+        return
+    if source.exists():
+        p = _run(["/usr/bin/swiftc", str(source), "-o", str(target)], timeout=120)
+        if p.returncode:
+            raise RuntimeError("窗口定位程序编译失败：" + p.stderr[-300:])
+
+def _visually_frontmost_window() -> tuple[int, int, int, int] | None:
+    """Ask the window server which WeChat window is actually visible on screen.
+
+    screencapture -R grabs whatever is drawn at those pixels, so a stale or
+    occluded window rect silently OCRs a different app. This is the ground truth.
+    """
+    _build_winlist()
+    tool = BIN / "wechat-winlist"
+    if not tool.exists():
+        return None
+    p = _run([str(tool)], timeout=10)
+    if p.returncode:
+        return None
+    rect = None
+    for line in p.stdout.splitlines():
+        nums = [int(v) for v in re.findall(r"-?\d+", line)]
+        if len(nums) >= 4:
+            rect = (nums[0], nums[1], nums[2], nums[3])  # front-to-back; first hit wins
+            break
+    return rect
+
 def _window_bounds() -> tuple[int, int, int, int]:
+    """Accessibility-reported frame, used only as a cross-check."""
     raw = _osascript('tell application "System Events" to tell process "WeChat" to return {position of window 1, size of window 1}')
     nums = [int(x) for x in re.findall(r"-?\d+", raw)]
     if len(nums) < 4: raise RuntimeError("无法读取微信窗口位置")
     return nums[0], nums[1], nums[2], nums[3]
 
-def _ensure_window() -> None:
-    _osascript('tell application "WeChat" to reopen\ntell application "WeChat" to activate')
-    time.sleep(0.5)
-    _window_bounds()
+def _frontmost_app() -> str:
+    try:
+        return _osascript('tell application "System Events" to return name of first process whose frontmost is true', timeout=8)
+    except Exception:
+        return ""
+
+def _ensure_window() -> tuple[int, int, int, int]:
+    """Bring WeChat to the front and verify it really is drawn there."""
+    _build_helpers()
+    for attempt in range(3):
+        try:
+            _osascript('tell application "WeChat" to reopen', timeout=8)
+            _osascript('tell application "WeChat" to activate', timeout=8)
+        except Exception:
+            pass
+        time.sleep(0.4 + 0.3 * attempt)
+        rect = _visually_frontmost_window()
+        if rect:
+            ax = _window_bounds()
+            # Trust the window server rect; AX can report a stale position.
+            return rect if rect[2] >= 400 else ax
+    front = _frontmost_app()
+    raise RuntimeError(
+        f"微信窗口未能显示在最前面（当前前台：{front or '未知'}）。"
+        "请先把微信主窗口切到当前桌面并置于最前，再重试。")
+
 
 def _normalize_title(value: str) -> str:
     value = re.sub(r"\s*[（(]\s*\d+\s*[)）]\s*$", "", value.strip())
     return re.sub(r"[^\w\u3400-\u9fff]", "", value).lower()
+
+def _title_equiv(line: str, wanted: str) -> bool:
+    """Emoji/decorated group names: WeChat shows the full title, the DB may hold a
+    plainer form. Accept exact equality after stripping non-word chars, plus a
+    containment check on a long enough prefix so '金秋十月' matches '金秋十月🍂'."""
+    got = _normalize_title(line)
+    if not wanted:
+        return False
+    if got == wanted:
+        return True
+    if len(wanted) >= 4 and (wanted in got or got in wanted):
+        return True
+    return False
+
 
 def _ocr_region(x: int, y: int, w: int, h: int, name: str) -> list[str]:
     image = Path("/tmp") / f"wechat-feedback-{name}.png"
@@ -84,39 +172,56 @@ def _ocr_region(x: int, y: int, w: int, h: int, name: str) -> list[str]:
     return [line.strip() for line in p.stdout.splitlines() if line.strip()]
 
 def _open_verified_chat(chat: str) -> dict:
-    _ensure_window(); _build_helpers()
+    bounds = _ensure_window()
+    x, y, w, h = bounds
     _clipboard_set(chat)
     if _osascript(SEARCH_MENU_SCRIPT) != "clicked":
         raise RuntimeError("未能打开微信本地搜索，已停止")
-    time.sleep(0.25)
+    time.sleep(0.35)
     _keys(['keystroke "a" using command down', 'keystroke "v" using command down'])
-    time.sleep(0.8)
-    x, y, w, h = _window_bounds()
+    time.sleep(1.1)
+    # Reactivating after the menu click could have pushed another app forward.
+    if _frontmost_app() not in ("WeChat", "微信"):
+        bounds = _ensure_window()
+        x, y, w, h = bounds
     wanted = _normalize_title(chat)
     search_lines = _ocr_region(x, y, max(220, int(w * 0.22)), min(360, int(h * 0.45)), "search")
-    exact_result = any(_normalize_title(line) == wanted for line in search_lines)
-    local_group_section = any("群聊" in line for line in search_lines)
-    if not (exact_result and local_group_section):
+
+    # The local "最常使用" panel lists the matching chat directly; the "群聊"
+    # section header only appears for broad/multi-hit queries, so it is NOT
+    # required. Requiring it rejected every uniquely-named group.
+    exact_result = any(_title_equiv(line, wanted) for line in search_lines)
+    if not exact_result:
         # If focus was wrong, remove only the text just pasted; never press Return.
         _keys(['keystroke "a" using command down', 'key code 51'])
-        raise RuntimeError(f"未在微信本地群聊结果中找到“{chat}”，已停止")
+        hint = "请确认微信已登录且主窗口在最前面"
+        raise RuntimeError(f"未在微信本地搜索结果中找到“{chat}”，已停止（{hint}）")
     # Only after an exact local result is visible may Return open it.
     _keys(['key code 36'])
-    time.sleep(0.9)
+    time.sleep(1.1)
     # Main chat header lies between the left conversation list and any optional right-side panel.
     header_lines = _ocr_region(x + int(w * 0.15), y, int(w * 0.48), min(110, h), "header")
-    matched = any(_normalize_title(line) == wanted for line in header_lines)
+    matched = any(_title_equiv(line, wanted) for line in header_lines)
     if not matched:
         raise RuntimeError(f"未能精确核验微信会话“{chat}”，已停止写入")
     return {"chat": chat, "header": header_lines, "bounds": [x, y, w, h]}
 
+
 def _focus_input(bounds: list[int]) -> None:
+    if _frontmost_app() not in ("WeChat", "微信"):
+        bounds = list(_ensure_window())
     x, y, w, h = bounds
     point_x = x + int(w * 0.43)
     point_y = y + int(h * 0.88)
     p = _run([str(CLICK), str(point_x), str(point_y)], timeout=10)
     if p.returncode: raise RuntimeError("无法聚焦微信输入框")
-    time.sleep(0.15)
+    time.sleep(0.25)
+    # A blind coordinate click lands on whatever window owns those pixels. If the
+    # click stole focus to another app, refuse to paste into it.
+    front = _frontmost_app()
+    if front not in ("WeChat", "微信"):
+        raise RuntimeError(f"点击输入框后前台变成了“{front or '未知'}”，为防误粘贴已停止。请把微信窗口切到最前再试。")
+
 
 def _write_and_verify(text: str, bounds: list[int]) -> None:
     _focus_input(bounds)
